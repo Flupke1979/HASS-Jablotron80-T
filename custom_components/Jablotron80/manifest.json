@@ -1,7 +1,7 @@
 {
-        "domain": "Jablotron80",
-        "name": "Jablotron 80 Component",
-        "documentation": "https://github.com/mattsaxon/hass-jablotron80",
-        "issue_tracker": "https://github.com/mattsaxon/hass-jablotron80/issues",
-        "codeowners": ["@mattsaxon"]
+        "domain": "Jablotron80T",
+        "name": "Jablotron 80-T Component",
+        "documentation": "https://github.com/fwpt/HASS-Jablotron80-T",
+        "issue_tracker": "https://github.com/fwpt/HASS-Jablotron80-T/issues",
+        "codeowners": ["@fwpt"]
 }

@@ -23,6 +23,14 @@ from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.typing import ConfigType, HomeAssistantType
 from homeassistant.components.sensor import PLATFORM_SCHEMA
 
+import queue
+#import importlib
+#import_module('homeassistant.custom_components.jablotron80.ja80')
+from .ja80 import JA80
+from .ja80 import JA80TConnection
+from .ja80 import JA80AlarmStatus
+from .ja80 import JA80AlarmTimestamp
+
 _LOGGER = logging.getLogger(__name__)
 
 CONF_SERIAL_PORT = 'serial_port'
@@ -67,7 +75,8 @@ JABLOTRON_KEY_MAP = {
 async def async_setup_platform(hass: HomeAssistantType, config: ConfigType,
                                async_add_entities, discovery_info=None):
 
-    async_add_entities([JablotronAlarm(hass,config)])
+    async_add_entities([JablotronAlarm(hass, config)])
+
 
 class JablotronAlarm(alarm.AlarmControlPanelEntity):
     """Representation of a Jabltron alarm status."""
@@ -79,11 +88,12 @@ class JablotronAlarm(alarm.AlarmControlPanelEntity):
         self._changed_by = None
         self._triggered_by = None
         self._name = config.get(CONF_NAME)
-        self._file_path = config.get(CONF_SERIAL_PORT)
+        self._serial_port = config.get(CONF_SERIAL_PORT)
         self._available = False
         self._code = config.get(CONF_CODE)
-        self._f = None
+        self._connection = None  # serial connection handle
         self._hass = hass
+        self._system = None
         self._config = config
         self._model = 'Unknown'
         self._lock = threading.BoundedSemaphore()
@@ -91,40 +101,36 @@ class JablotronAlarm(alarm.AlarmControlPanelEntity):
         self._updated = asyncio.Event()
         self._desired_state_updated = asyncio.Event()
         self._wait_task = None
+        self._command_q = queue.Queue()
+        # self._tamper_treshold = config.get(CONF_CODE)
+        # self._tamper_window = config.get(CONF_CODE)
 
         try:
             hass.bus.async_listen('homeassistant_stop', self.shutdown_threads)
 
             from concurrent.futures import ThreadPoolExecutor
             self._io_pool_exc = ThreadPoolExecutor(max_workers=5)
-            #self._io_pool_exc.submit(self._startup_message)
 
-            self._startup_message()
-
-            self._read_loop_future = self._io_pool_exc.submit(self._read_loop)
+            self._loop_future = self._io_pool_exc.submit(self._connection_loop)
 
             self.loop = asyncio.get_running_loop()
 
-            self.loop.create_task(self.send_command_loop())
+            self.loop.create_task(self.state_loop())
 
         except Exception as ex:
-            _LOGGER.error('Unexpected error: %s', format(ex) )
-
+            _LOGGER.error('Unexpected error: %s', format(ex))
 
     def shutdown_threads(self, event):
 
-        _LOGGER.debug('handle_shutdown() called' )
+        _LOGGER.debug('handle_shutdown() called')
 
         self._stop.set()
         if self._wait_task is not None:
             self._wait_task.cancel()
 
-        _LOGGER.debug('exiting handle_shutdown()' )
+        self._command_q.put(None)
 
-#    @property
-#    def unique_id(self):
-#        """Return a unique ID."""
-#        return 'alarm_control_panel.jablotron.test'
+        _LOGGER.debug('exiting handle_shutdown()')
 
     @property
     def should_poll(self):
@@ -145,7 +151,7 @@ class JablotronAlarm(alarm.AlarmControlPanelEntity):
     def changed_by(self):
         """Return the last source of state change."""
         return self._changed_by
-        
+
     @property
     def triggered_by(self):
         """Return the sensor which triggered the alarm"""
@@ -174,7 +180,7 @@ class JablotronAlarm(alarm.AlarmControlPanelEntity):
     def supported_features(self) -> int:
         """Return the list of supported features."""
         return SUPPORT_ALARM_ARM_HOME | SUPPORT_ALARM_ARM_AWAY | SUPPORT_ALARM_TRIGGER | SUPPORT_ALARM_ARM_NIGHT
-    
+
     @property
     def state_attributes(self):
         """Return the state attributes."""
@@ -188,25 +194,41 @@ class JablotronAlarm(alarm.AlarmControlPanelEntity):
 
     async def _update(self):
 
-        #_LOGGER.debug('_update called, state: %s', self._state )
+        # _LOGGER.debug('_update called, state: %s', self._state )
         self._updated.set()
         self.async_schedule_update_ha_state()
-        #_LOGGER.debug('_update exited, state: %s', self._state )
-
-    def _read_loop(self):
+        # _LOGGER.debug('_update exited, state: %s', self._state )
+        
+    def _connection_loop(self):
 
         try:
-            self._f = open(self._file_path, 'rb', 64)
+            # try to create serial connection and provide command queue ref
+            self._connection = JA80TConnection(self._serial_port, self._command_q)
+            self._connection.connect()
+            self._system = JA80()  # holds the JA80 alarm system's specific logic
+            self._model = 'Jablotron Oasis JA-82K'
 
             lastTriggerTime = None
 
             while not self._stop.is_set():
 
-                time.sleep(1) # read state once every second, no need for more!
-
-                #self._lock.acquire()
-
-                new_state = self._read()
+                # read next packet and send command if we have one queued
+                event_data = self._connection.read_send_packet()
+                if event_data is False:
+                    # error occured during reading, should not happen
+                    self._available = False
+                    new_state = 'No Signal'
+                elif event_data is None:
+                    # no event or unrecognised data; ignore and do a new read
+                    continue
+                else: 
+                    self._available = True
+                    new_state = self._system.read_state(event_data)
+                    if new_state is None:
+                        # no state or irrelevant/ignored event, do a new read
+                        continue
+                    if self._system.sensor_id is not None:
+                        self._triggered_by = "%s: %s" % (self._system.sensor_id, self._config[CONF_CODE_SENSOR_NAMES].get(self._system.sensor_id, '?'))
 
                 if new_state != self._state:
                     _LOGGER.info("Jablotron state change detected: %s to %s", self._state, new_state)
@@ -214,144 +236,27 @@ class JablotronAlarm(alarm.AlarmControlPanelEntity):
                         _LOGGER.debug("Alarm triggered but source not known yet")
 
                         # wait for _triggered_by to be set before returning triggered state, but not more that 10 seconds
-                        if lastTriggerTime is not None and (datetime.now() - lastTriggerTime).seconds < 10: 
-                            continue 
+                        if lastTriggerTime is not None and (datetime.now() - lastTriggerTime).seconds < 10:
+                            continue
                         elif lastTriggerTime is None:
                             lastTriggerTime = datetime.now()
                             continue
 
                     elif new_state == STATE_ALARM_DISARMED:
-                        lastTriggerTime = None # clear last trigger time
-                        self._triggered_by = None # clear triggered_by
-                    
+                        lastTriggerTime = None  # clear last trigger time
+                        self._triggered_by = None  # clear triggered_by
+                        self._system.sensor_id = None
+
                     # Update state & notify home assistant
                     self._state = new_state
                     asyncio.run_coroutine_threadsafe(self._update(), self._hass.loop)
-                        
-                #self._lock.release()
 
         except Exception as ex:
-            _LOGGER.error('Unexpected error: %s', format(ex) )
+            _LOGGER.error('Unexpected error: %s', format(ex))
 
         finally:
-            self._f.close()
-            _LOGGER.debug('exiting read_loop()' )
-
-    def _read(self):
-
-        state = None
-
-        try:
-            while True:
-
-                self._lock.acquire()
-                packet = self._f.read(64)
-                self._lock.release()
-
-                if not packet:
-                    _LOGGER.warn("No packets")
-                    self._available = False
-                    return 'No Signal'   
-
-                self._available = True
-
-                if packet[:1] == b'\x82': # all JA-82 packets begin x82 
-
-                    self._model = 'Jablotron JA-80 Series'
-                    byte_two = int.from_bytes(packet[1:2], byteorder='big', signed=False)
-                    
-                    # Startup packet
-                    if byte_two == 62: # '>' symbol is received on startup
-                        _LOGGER.info("Startup response packet is: %s", packet[1:8])
-
-                    # Status packet
-                    elif byte_two == 1: 
-                        # and byte_two <= 8: # and byte_two != 2: # all 2nd packets I have seen are between 1 and 8, but 2 packets sometimes have trigger message 
-
-                        state_byte = packet[2:3]
-                    
-                        # heartbeats or null
-                        if state_byte in (b'\xed', b'\xff', b'\x00'):
-                            state = "ignore" # no change 
-                        # Stable states
-                        elif state_byte == b'@': 
-                            state = STATE_ALARM_DISARMED
-                        elif state_byte in (b'Q', b'R', b'S') and self._state == STATE_ALARM_DISARMED:
-                            state = STATE_ALARM_ARMING # Zone A; A&B; A&B&C
-                        elif state_byte == b'A':
-                            state = STATE_ALARM_ARMED_HOME
-                        elif state_byte == b'B':
-                            state = STATE_ALARM_ARMED_NIGHT
-                        elif state_byte == b'C':
-                            state = STATE_ALARM_ARMED_AWAY
-                        elif state_byte == b'D' :
-                            state = STATE_ALARM_TRIGGERED # via '24 hour' sensor when unset
-                        elif state_byte in (b'E', b'G') :
-                            state = STATE_ALARM_TRIGGERED # when zone A is set, via standard sensor when set
-                        # Temporary states
-                        elif state_byte == b'K' and self._state == STATE_ALARM_ARMED_AWAY:
-                            state = STATE_ALARM_PENDING
-                        elif state_byte in (b'\xa1', b'$') and self._state == STATE_ALARM_ARMING:
-                            state = STATE_ALARM_ARMING # during arm & arm away (beeps?)
-                        elif state_byte in (b'\x02', b'\xe8', b'=') and self._state == STATE_ALARM_TRIGGERED:
-                            state = STATE_ALARM_TRIGGERED # during alarm & alarm night
-                        elif state_byte in (b'\xa4', b'\xa0', b'\xb8') and self._state != STATE_ALARM_DISARMED:
-                            state = STATE_ALARM_DISARMING
-                        # Keypress 
-                        elif state_byte in (b'\x80', b'\x81', b'\x82', b'\x83', b'\x84', b'\x85', b'\x86', b'\x87', b'\x88', b'\x89', b'\x8e', b'\x8f'):
-                            state = "ignore" # no change
-
-                        if state == "ignore":
-                            pass
-                        elif state is not None:
-                            return state
-                        else:
-                            _LOGGER.debug("Unknown status packet is %s", packet[2:8])
-
-                    # Packets x07?F*\x1* contains the id of the device which triggered the alarm
-                    elif (byte_two == 7 and self._triggered_by is None and 
-                            (
-                                (packet[2:4] == b'GF' and packet[5:7] == b'\x1f<') or # when away
-                                (packet[2:4] == b'EF' and packet[5:7] == b'\x19<')  # when home
-                            )): 
-                        _LOGGER.debug("Sensor status packet is: %s", packet[1:8])
-                        sensor_id = int.from_bytes(packet[4:5], byteorder='big', signed=False)
-                        triggered_sensor = "%s: %s" % (sensor_id, self._config[CONF_CODE_SENSOR_NAMES].get(sensor_id, '?'))
-                        _LOGGER.info("Alarm triggered by sensor %s", triggered_sensor)
-                        self._triggered_by = triggered_sensor
-                        return STATE_ALARM_TRIGGERED
-
-                    # Packets x07G*\x1* contains the id of the device which have been sabotaged
-                    elif (byte_two == 7 and self._triggered_by is None and 
-                            (
-                                (packet[2:3] == b'G' and packet[4:6] == b'\x1f<')  or # when away
-                                (packet[2:3] == b'G' and packet[4:6] == b'\x19<') # when home
-                            )): 
-                        _LOGGER.debug("Sensor status packet is: %s", packet[1:8])
-                        sensor_id = int.from_bytes(packet[3:4], byteorder='big', signed=False)
-                        triggered_sensor = "%s: %s (sabotage)" % (sensor_id, self._config[CONF_CODE_SENSOR_NAMES].get(sensor_id, '?'))
-                        _LOGGER.info("Alarm triggered by sabotaged sensor %s", triggered_sensor)
-                        self._triggered_by = triggered_sensor
-                        return STATE_ALARM_TRIGGERED
-
-                    else:
-                        # FOR REVERSE ENGINEERING ONLY: will produce A LOT of logs
-                        #_LOGGER.debug("Unknown packet when triggered %s", packet[1:8])
-                        pass
-
-                else:
-                    _LOGGER.error("The data stream is not recongisable as a JA-82 control panel. Please raise an issue at https://github.com/mattsaxon/HASS-Jablotron80/issues with this packet info [%s]", packet)
-                    self._stop.set()
-
-        except (IndexError, FileNotFoundError, IsADirectoryError,
-                UnboundLocalError, OSError):
-            _LOGGER.warning("File or data not present at the moment: %s",
-                            self._file_path)
-            return 'Failed'
-
-        except Exception as ex:
-            _LOGGER.error('Unexpected error: %s', format(ex) )
-            return 'Failed'
+            self._connection.close()
+            _LOGGER.debug('exiting read_loop()')
 
     async def async_alarm_disarm(self, code=None):
         """Send disarm command.
@@ -363,17 +268,18 @@ class JablotronAlarm(alarm.AlarmControlPanelEntity):
             return
 
         send_code = ""
-
         if self._config[CONF_CODE_PANEL_DISARM_REQUIRED]:
-            # Use code from config if and onlfy is none is entered by user and setup as not required
+            # Use code from config if and only if none is entered by user and setup as not required
             if code is None and not self._config[CONF_CODE_DISARM_REQUIRED]:
                 code = self._code
             send_code = code
 
         action = "*0"
+        if send_code != "":
+            # *0 not required if we disarm using code
+            action = "#"
 
         await self._sendCommand(send_code, action, STATE_ALARM_DISARMED)
-
 
     async def async_alarm_arm_home(self, code=None):
         """Send arm home command.
@@ -391,7 +297,6 @@ class JablotronAlarm(alarm.AlarmControlPanelEntity):
 
         await self._sendCommand(send_code, action, STATE_ALARM_ARMED_HOME)
 
-
     async def async_alarm_arm_away(self, code=None):
         """Send arm away command.
 
@@ -407,7 +312,6 @@ class JablotronAlarm(alarm.AlarmControlPanelEntity):
         action = "*1"
 
         await self._sendCommand(send_code, action, STATE_ALARM_ARMED_AWAY)
-
 
     async def async_alarm_arm_night(self, code=None):
         """Send arm night command.
@@ -425,15 +329,17 @@ class JablotronAlarm(alarm.AlarmControlPanelEntity):
 
         await self._sendCommand(send_code, action, STATE_ALARM_ARMED_NIGHT)
 
-
     async def _sendCommand(self, code, action, desired_state):
 
         payload = action
 
-        if code is not None:
+        if code is not None and code != "":
             payload += code
 
-        self._payload = payload
+        for cmd in payload:
+            # self._command_q.put(bytes([cmd]))
+            self._command_q.put(JABLOTRON_KEY_MAP.get(cmd))
+
         self._desired_state = desired_state
         self._changed_by = "hass"
 
@@ -442,10 +348,9 @@ class JablotronAlarm(alarm.AlarmControlPanelEntity):
         if self._wait_task is not None:
             self._wait_task.cancel()
 
+    async def state_loop(self):
 
-    async def send_command_loop(self):
-
-        _LOGGER.debug('send_command_loop() enter')
+        _LOGGER.debug('state_loop() enter')
 
         while not self._stop.is_set():
 
@@ -454,14 +359,15 @@ class JablotronAlarm(alarm.AlarmControlPanelEntity):
             await self._desired_state_updated.wait()
             self._desired_state_updated.clear()
 
-            _LOGGER.debug('command received: %s', self._payload)
+            # _LOGGER.debug('command received: %s', self._payload)
+            _LOGGER.debug('state change request received: %s', self._desired_state)
 
             while self.state != self._desired_state:
 
                 self._updated.clear()
 
-                if not retrying or (self.state != STATE_ALARM_ARMING and self.state != STATE_ALARM_DISARMING and self.state != STATE_ALARM_PENDING) :
-                    await self._send_keys(self._payload)
+                # if not retrying or (self.state != STATE_ALARM_ARMING and self.state != STATE_ALARM_DISARMING and self.state != STATE_ALARM_PENDING) :
+                #     await self._send_keys(self._payload)
 
                 try:
 
@@ -482,49 +388,14 @@ class JablotronAlarm(alarm.AlarmControlPanelEntity):
                     break
 
                 except Exception as ex:
-                    _LOGGER.error('Unexpected error: %s', format(ex) )
+                    _LOGGER.error('Unexpected error: %s', format(ex))
                     break
 
                 retrying = True
 
                 _LOGGER.debug('state: %s', self.state)
 
-        _LOGGER.debug('send_command_loop(): exit')
-
-
-    async def _send_keys(self, payload):
-        """Send via serial port."""
-
-        _LOGGER.debug("sending %s", payload)
-
-        try:
-            self._lock.acquire()
-
-            packet_no = 0
-            for c in payload:
-                packet_no +=1
-                packet = b'\x00\x02\x01' + JABLOTRON_KEY_MAP.get(c)
-                _LOGGER.debug('sending packet %i, message: %s', packet_no, packet)
-                self._send_packet(packet)
-                await asyncio.sleep(0.1) # lower reliability without this delay
-
-        except Exception as ex:
-            _LOGGER.error('Unexpected error: %s', format(ex) )
-
-        finally:
-            self._lock.release()
-
-    def _send_packet(self, packet):
-        f = open(self._file_path, 'wb')
-        f.write(packet)
-        f.close()        
-
-    def _startup_message(self):
-        """ Send Start Message to panel"""
-
-        _LOGGER.debug('Sending startup message')
-        self._send_packet(b'\x00\x00\x01\x01')
-        _LOGGER.debug('Successfully sent startup message')
+        _LOGGER.debug('state_loop(): exit')
 
     def _validate_code(self, code, state):
         """Validate given code."""
